@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>远程剪辑协作原型 — 媒体语义协同编辑</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>远程剪辑协作原型</h1>
+  <div class="legend">
+    <span>时间单位：整数 ticks，主时基 <b>30000 ticks/秒</b>（精确有理数，无浮点）</span>
+    <button id="btn-export">导出最终时间线 JSON/EDL</button>
+    <button id="btn-render">解码最终时间线全部输出帧</button>
+  </div>
+  <div id="global-render" class="global-render hidden"></div>
+</header>
+
+<main class="editors">
+  <!-- Two full editors, each with its OWN websocket connection and state. -->
+  <section class="editor" id="panel-alice" data-editor="alice"></section>
+  <section class="editor" id="panel-bob" data-editor="bob"></section>
+</main>
+
+<template id="editor-template">
+  <div class="panel-head">
+    <div class="who">
+      <span class="dot"></span>
+      <h2 class="name"></h2>
+      <span class="conn badge">未连接</span>
+      <span class="ver badge">v0 / seq0</span>
+      <span class="peers badge"></span>
+    </div>
+    <div class="faults">
+      <button data-act="reconnect">断线重连（重放缺失事件）</button>
+      <button data-act="duplicate">重发上一条（重复消息）</button>
+      <button data-act="stale">发过期版本（制造边界冲突）</button>
+    </div>
+  </div>
+
+  <div class="opform">
+    <h3>操作（全部按片段 ID + 字段版本定位，不用数组下标）</h3>
+    <div class="form-row">
+      <label>类型
+        <select data-field="type">
+          <option value="insert">insert 插入素材</option>
+          <option value="trim">trim 裁切边界</option>
+          <option value="split">split 分割</option>
+          <option value="move">move 移动</option>
+          <option value="remove">remove 删除</option>
+        </select>
+      </label>
+      <label data-only="insert">素材 <select data-field="sourceId"></select></label>
+      <label data-only="trim">边界 <select data-field="side"><option value="in">trim-in 入点</option><option value="out">trim-out 出点</option></select></label>
+      <label data-only="insert,trim,split">片段ID <input data-field="clipId" placeholder="如 clip-7" /></label>
+      <label data-only="insert,trim">srcIn(ticks) <input type="number" data-field="srcIn" step="1000" /></label>
+      <label data-only="insert,trim">srcOut(ticks) <input type="number" data-field="srcOut" step="1000" /></label>
+      <label data-only="insert,move">timelineIn(ticks) <input type="number" data-field="timelineIn" step="1000" /></label>
+      <label data-only="trim,split,move,remove">baseVersion <input type="number" data-field="baseVersion" min="0" /></label>
+      <label data-only="split">分割点 srcAt(ticks) <input type="number" data-field="at" step="1000" /></label>
+      <label data-only="move">新 timelineIn(ticks) <input type="number" data-field="newTimelineIn" step="1000" /></label>
+      <button data-act="submit">发送操作</button>
+    </div>
+    <p class="hint">提示：点时间线上的片段会自动填入 clipId 与其当前字段版本；ticks 旁显示等价秒数（仅展示）。</p>
+  </div>
+
+  <div class="status-grid">
+    <div class="col">
+      <h3>仍待处理（pending，未获服务端确认）</h3>
+      <ul class="pending-list empty"><li class="empty-note">无待确认操作</li></ul>
+    </div>
+    <div class="col">
+      <h3>冲突与拒绝（显式规则，绝不静默覆盖）</h3>
+      <ul class="conflict-list empty"><li class="empty-note">无冲突</li></ul>
+    </div>
+  </div>
+
+  <div class="timeline-wrap">
+    <h3>已确认时间线（服务端权威状态，按真实媒体语义渲染）</h3>
+    <div class="ruler"></div>
+    <div class="track"></div>
+  </div>
+
+  <div class="preview">
+    <h3>画面预览（按最终采用时间线实际解码）</h3>
+    <div class="preview-controls">
+      <label>播放头 tick <input type="number" class="playhead" value="0" step="1000" /></label>
+      <button data-act="preview">解码该 tick</button>
+      <span class="preview-meta"></span>
+    </div>
+    <div class="preview-frame"><span class="preview-empty">输入 tick 后点解码</span></div>
+  </div>
+
+  <div class="eventlog">
+    <h3>事件日志（可重放）</h3>
+    <ol class="log-list"></ol>
+  </div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
