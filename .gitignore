@@ -26,3 +26,7 @@ __pycache__/
 
 # generated test media (regenerate with `npm run media`)
 media/
+
+# local v2 operation-log journal and migration sidecars
+data/
+*.unknown.jsonl

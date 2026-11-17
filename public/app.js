@@ -1,24 +1,23 @@
 'use strict';
-/* global document, window, fetch, WebSocket */
+/* global document, window, fetch, CollabSession */
 
 const TPS = 30000;
 const sec = (t) => (t / TPS).toFixed(3) + 's';
 const uid = (p) => `${p}-${Math.random().toString(36).slice(2, 9)}`;
 
+// Thin UI binding: every state fact lives in the CollabSession kernel. The
+// panel renders kernel state and turns gestures into kernel calls; it never
+// applies local state on its own.
 class Editor {
   constructor(editorId, color) {
     this.id = editorId;
     this.color = color;
-    this.ws = null;
-    this.state = null;
-    this.snapshotDirty = false;
-    this.pending = new Map(); // opId -> op
-    this.conflicts = [];
-    this.log = [];
+    this.session = new CollabSession(editorId);
     this.selectedClip = null;
     this.lastOp = null;
     this._buildDom();
-    this.connect(0);
+    this._bindKernel();
+    this.session.connect(0);
   }
 
   _buildDom() {
@@ -30,7 +29,8 @@ class Editor {
     this.el('.dot').style.background = this.color;
 
     fetch('/api/snapshot').then((r) => r.json()).then((s) => {
-      this.state = s;
+      this.session.state = s;
+      this.session.logFormat = s.logFormat;
       for (const src of s.sources) {
         const opt = document.createElement('option');
         opt.value = src.id;
@@ -38,36 +38,36 @@ class Editor {
         this.el('[data-field="sourceId"]').appendChild(opt);
       }
       this._render();
+      this._renderLogBadge();
     });
 
     this.el('[data-field="type"]').addEventListener('change', () => this._syncFormVisibility());
     this.el('[data-act="submit"]').addEventListener('click', () => this._submit(false));
-    this.el('[data-act="reconnect"]').addEventListener('click', () => this.reconnect());
+    this.el('[data-act="reconnect"]').addEventListener('click', () => this.session.reconnect());
     this.el('[data-act="duplicate"]').addEventListener('click', () => this._resendDuplicate());
     this.el('[data-act="stale"]').addEventListener('click', () => this._submit(true));
     this.el('[data-act="preview"]').addEventListener('click', () => this._preview());
     this._syncFormVisibility();
   }
 
-  connect(lastSeq) {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
-    this.ws = ws;
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'hello', clientId: this.id, lastSeq }));
-      this._setConn(true);
-    };
-    ws.onmessage = (ev) => this._onMessage(JSON.parse(ev.data));
-    ws.onclose = () => { this._setConn(false); };
-    ws.onerror = () => { try { ws.close(); } catch { /* noop */ } };
+  _bindKernel() {
+    const s = this.session;
+    s.subscribe((kind, payload) => {
+      if (kind === 'connection') this._setConn(payload.online);
+      if (kind === 'snapshot' || kind === 'record' || kind === 'pending' || kind === 'resend' || kind === 'conflicts') {
+        this._render();
+      }
+      if (kind === 'error') this._flashError(payload.reason);
+      if (kind === 'undo_done') this._render();
+    });
   }
 
-  reconnect() {
-    try { this.ws && this.ws.close(); } catch { /* noop */ }
-    const lastSeq = this.state ? this.state.seq : 0;
-    // Pending ops that never got an answer survive the disconnect: they are
-    // re-sent after hello, and server-side opId dedup makes this safe.
-    this.connect(lastSeq);
+  _flashError(reason) {
+    const badge = this.el('.ver.badge');
+    const old = badge.textContent;
+    badge.textContent = `内核错误: ${reason}`;
+    badge.style.color = 'var(--warn)';
+    setTimeout(() => { badge.textContent = old; badge.style.color = ''; }, 2500);
   }
 
   _setConn(online) {
@@ -76,41 +76,14 @@ class Editor {
     dot.classList.toggle('online', online);
     badge.textContent = online ? '已连接' : '断线';
     badge.style.color = online ? 'var(--ok)' : 'var(--warn)';
-  }
-
-  _onMessage(msg) {
-    if (msg.type === 'hello_ack' || msg.type === 'peer_joined' || msg.type === 'peer_left') {
-      if (msg.peers) this.el('.peers.badge').textContent = `peers: ${msg.peers.filter((p) => p !== this.id).join(', ') || '（仅自己）'}`;
-      if (msg.type === 'hello_ack') this.el('.ver.badge').textContent = `v${msg.serverVersion} / seq${msg.seq}`;
-      return;
-    }
-    if (msg.type === 'snapshot') {
-      this.state = msg.state;
-      this.el('.ver.badge').textContent = `v${msg.state.version} / seq${msg.state.seq}`;
-      this._render();
-      return;
-    }
-    if (msg.type === 'applied' || msg.type === 'rejected') {
-      this.log.push(msg);
-      if (msg.type === 'applied' && this.pending.has(msg.op.opId)) this.pending.delete(msg.op.opId);
-      if (msg.type === 'rejected') this.conflicts.unshift(msg);
-      if (!msg.duplicate) this._scheduleSnapshot();
-      this._renderLists();
+    if (online && this.session.state) {
+      this.el('.ver.badge').textContent = `v${this.session.state.version} / seq${this.session.state.seq}`;
     }
   }
 
-  _scheduleSnapshot() {
-    if (this.snapshotDirty) return;
-    this.snapshotDirty = true;
-    setTimeout(async () => {
-      this.snapshotDirty = false;
-      try {
-        const r = await fetch('/api/snapshot');
-        this.state = await r.json();
-        this.el('.ver.badge').textContent = `v${this.state.version} / seq${this.state.seq}`;
-        this._render();
-      } catch { /* will retry on next event */ }
-    }, 30);
+  _renderLogBadge() {
+    const lf = this.session.logFormat;
+    if (lf) this.el('.logformat.badge').textContent = `${lf.format} v${lf.formatVersion}`;
   }
 
   _readForm() {
@@ -145,8 +118,9 @@ class Editor {
   }
 
   _nextFreeTick() {
-    if (!this.state || !this.state.clips.length) return 0;
-    return Math.max(...this.state.clips.map((c) => c.timelineOut));
+    const st = this.session.state;
+    if (!st || !st.clips.length) return 0;
+    return Math.max(...st.clips.map((c) => c.timelineOut));
   }
 
   _submit(forceStale) {
@@ -154,17 +128,16 @@ class Editor {
     try { op = this._readForm(); } catch (e) { window.alert(e.message); return; }
     if (forceStale && Number.isInteger(op.baseVersion)) op.baseVersion = Math.max(0, op.baseVersion - 2);
     this.lastOp = op;
-    this.pending.set(op.opId, op);
-    this.ws.send(JSON.stringify({ type: 'op', op }));
-    this._renderLists();
+    this.session.submit(op);
+    this._render();
   }
 
   _resendDuplicate() {
     if (!this.lastOp) { window.alert('还没有发送过操作'); return; }
     // Same opId: server must treat this as a duplicate, never apply twice.
-    this.ws.send(JSON.stringify({ type: 'op', op: this.lastOp }));
-    this.log.push({ type: 'rejected', reason: '(client) duplicate re-sent locally', op: this.lastOp, localNote: true });
-    this._renderLists();
+    this.session.resend(this.lastOp);
+    this.session.history.push({ type: 'rejected', reason: '(client) duplicate re-sent locally', op: this.lastOp, localNote: true });
+    this._render();
   }
 
   async _preview() {
@@ -212,18 +185,60 @@ class Editor {
     this._render();
   }
 
+  // Drag a clip on the track: the gesture becomes a normal kernel move op, so
+  // concurrent modifications are checked by the same conflict rules as the
+  // form. A rejected drag surfaces in the conflict list instead of moving.
+  _bindDrag(div, clip) {
+    div.draggable = true;
+    div.addEventListener('dragstart', (ev) => {
+      ev.dataTransfer.setData('text/plain', clip.id);
+      ev.dataTransfer.effectAllowed = 'move';
+    });
+  }
+
+  _bindTrackDrop() {
+    if (this._dropBound) return;
+    this._dropBound = true;
+    const track = this.el('.track');
+    track.addEventListener('dragover', (ev) => ev.preventDefault());
+    track.addEventListener('drop', (ev) => {
+      ev.preventDefault();
+      const id = ev.dataTransfer.getData('text/plain');
+      if (!id) return;
+      const st = this.session.state;
+      const current = st.clips.find((c) => c.id === id);
+      if (!current) return;
+      const rect = track.getBoundingClientRect();
+      const maxTick = Math.max(90000, ...st.clips.map((c) => c.timelineOut));
+      const scale = rect.width / maxTick;
+      const tick = Math.max(0, Math.round((ev.clientX - rect.left) / scale / 1000) * 1000);
+      if (tick === current.timelineIn) return;
+      const op = {
+        type: 'move', opId: uid(`op-${this.id}`), clientId: this.id,
+        clipId: id, newTimelineIn: tick, baseVersion: st.version,
+      };
+      this.lastOp = op;
+      this.session.submit(op);
+    });
+  }
+
   _render() {
-    if (!this.state) return;
+    const st = this.session.state;
+    if (!st) return;
+    this.el('.ver.badge').textContent = `v${st.version} / seq${st.seq}`;
+    this._renderLogBadge();
     this._renderTrack();
     this._renderLists();
   }
 
   _renderTrack() {
+    const st = this.session.state;
     const track = this.el('.track');
     const ruler = this.el('.ruler');
     track.innerHTML = '';
     ruler.innerHTML = '';
-    const clips = this.state.clips;
+    this._bindTrackDrop();
+    const clips = st.clips;
     const maxTick = Math.max(90000, ...clips.map((c) => c.timelineOut));
     const width = track.clientWidth || 600;
     const scale = width / maxTick;
@@ -248,29 +263,31 @@ class Editor {
         <div class="meta">TL[${sec(clip.timelineIn)}→${sec(clip.timelineOut)}]</div>
         <div class="fv">v in:${fv.srcIn ?? '-'} out:${fv.srcOut ?? '-'} pos:${fv.timelineIn ?? '-'}</div>`;
       div.addEventListener('click', () => this._fillFromClip(clip));
+      this._bindDrag(div, clip);
       track.appendChild(div);
     }
   }
 
   _renderLists() {
+    const s = this.session;
     const pendingUl = this.el('.pending-list');
-    pendingUl.className = `pending-list${this.pending.size ? '' : ' empty'}`;
+    pendingUl.className = `pending-list${s.pending.size ? '' : ' empty'}`;
     pendingUl.innerHTML = '';
-    if (!this.pending.size) pendingUl.innerHTML = '<li class="empty-note">无待确认操作</li>';
-    for (const op of this.pending.values()) {
+    if (!s.pending.size) pendingUl.innerHTML = '<li class="empty-note">无待确认操作</li>';
+    for (const op of s.pending.values()) {
       const li = document.createElement('li');
       li.textContent = `⏳ ${op.opId}  ${op.type} ${op.clipId || ''} ${JSON.stringify(this._opShorthand(op))}`;
       pendingUl.appendChild(li);
     }
 
     const confUl = this.el('.conflict-list');
-    confUl.className = `conflict-list${this.conflicts.length ? '' : ' empty'}`;
+    confUl.className = `conflict-list${s.conflicts.length ? '' : ' empty'}`;
     confUl.innerHTML = '';
-    if (!this.conflicts.length) confUl.innerHTML = '<li class="empty-note">无冲突</li>';
-    for (const rej of this.conflicts.slice(0, 8)) {
+    if (!s.conflicts.length) confUl.innerHTML = '<li class="empty-note">无冲突</li>';
+    for (const rej of s.conflicts.slice(0, 8)) {
       const li = document.createElement('li');
       const detail = rej.conflict
-        ? `字段冲突: ${rej.conflict.changedFields.map((c) => `${c.field}=${c.value}(v${c.version}, by ${c.editor})`).join('; ')}；你的 baseVersion=${rej.op.baseVersion}`
+        ? `字段冲突: ${rej.conflict.changedFields.map((c) => `${c.field}=${c.value}(v${c.version}, by ${c.editor})`).join('; ')}；你的 baseRevision=${rej.op.baseVersion}`
         : rej.reason;
       li.innerHTML = `<b>${rej.reason}</b><br/>op ${rej.op.opId} (${rej.op.type} ${rej.op.clipId || ''})<br/>${detail}`;
       if (rej.conflict) {
@@ -278,10 +295,14 @@ class Editor {
         row.className = 'resolve';
         const theirs = document.createElement('button');
         theirs.textContent = '采用对方值（关闭）';
-        theirs.onclick = () => { this.conflicts = this.conflicts.filter((x) => x !== rej); this._renderLists(); };
+        theirs.onclick = () => s.dismissConflict(rej);
         const mine = document.createElement('button');
         mine.textContent = '用最新版本重试我的值';
-        mine.onclick = () => this._retryConflict(rej);
+        mine.onclick = () => {
+          s.dismissConflict(rej);
+          const retry = s.retryOp(rej, uid(`op-${this.id}`));
+          if (retry) this.lastOp = retry;
+        };
         row.append(theirs, mine);
         li.appendChild(row);
       }
@@ -290,12 +311,20 @@ class Editor {
 
     const logOl = this.el('.log-list');
     logOl.innerHTML = '';
-    for (const ev of this.log.slice(-30)) {
+    for (const ev of s.history.slice(-30)) {
       const li = document.createElement('li');
       li.className = ev.type;
       const tag = ev.type === 'applied' ? '✓ 已确认' : '✗ 拒绝';
       const dup = ev.duplicate ? ' [重复消息，幂等忽略]' : '';
-      li.innerHTML = `<span class="seq">seq${ev.seq ?? '-'} v${ev.version ?? ev.serverVersion ?? '-'}</span> ${tag}${dup}<br/>${ev.clientId}:${ev.op ? ev.op.type : ''} ${ev.op && ev.op.clipId ? ev.op.clipId : ''} ${ev.reason ? '— ' + ev.reason : ''}`;
+      const base = ev.result ? `base=${ev.result.baseRevision}` : '';
+      li.innerHTML = `<span class="seq">seq${ev.seq ?? '-'} v${ev.version ?? ev.serverVersion ?? '-'} ${base}</span> ${tag}${dup}<br/>${ev.clientId}:${ev.op ? ev.op.type : ''} ${ev.op && ev.op.clipId ? ev.op.clipId : ''} ${ev.reason ? '— ' + ev.reason : ''}`;
+      if (ev.type === 'applied' && !ev.localNote) {
+        const undoBtn = document.createElement('button');
+        undoBtn.className = 'undo-btn';
+        undoBtn.textContent = '撤销';
+        undoBtn.onclick = () => s.undoSeq(ev.seq);
+        li.appendChild(undoBtn);
+      }
       logOl.appendChild(li);
     }
   }
@@ -306,22 +335,13 @@ class Editor {
     for (const k of keys) if (op[k] !== undefined) out[k] = op[k];
     return out;
   }
-
-  async _retryConflict(rej) {
-    if (!this.state) return;
-    const clip = this.state.clips.find((c) => c.id === rej.op.clipId);
-    if (!clip) { window.alert('片段已不存在（可能已被删除/分割）'); return; }
-    const retry = { ...rej.op, opId: uid(`op-${this.id}`), baseVersion: this.state.version };
-    this.pending.set(retry.opId, retry);
-    this.lastOp = retry;
-    this.ws.send(JSON.stringify({ type: 'op', op: retry }));
-    this._renderLists();
-  }
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  new Editor('alice', 'var(--alice)');
-  new Editor('bob', 'var(--bob)');
+  window.editors = {
+    alice: new Editor('alice', 'var(--alice)'),
+    bob: new Editor('bob', 'var(--bob)'),
+  };
 
   document.getElementById('btn-export').onclick = async () => {
     const r = await fetch('/api/export');

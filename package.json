@@ -1,14 +1,19 @@
 {
   "name": "collab-video-edit-prototype",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Remote collaborative video-editing prototype: identity-based clips, replayable ops, explicit conflicts, exact media time, real frame decoding.",
+  "description": "Remote collaborative video-editing prototype: identity-based clips, replayable ops, explicit conflicts, exact media time, real frame decoding. v2.0.0 introduces the explicit v2 operation log (object identity, base revision, op result) and the v1->v2 log migration.",
   "engines": { "node": ">=20" },
   "scripts": {
     "media": "node scripts/gen_media.js",
     "start": "node bin/serve.js",
-    "test": "node --test test/collab.test.js",
-    "smoke": "node test/smoke_live.js"
+    "test": "node --test test/collab.test.js test/migration.test.js",
+    "test:collab": "node --test test/collab.test.js",
+    "test:migration": "node --test test/migration.test.js",
+    "smoke": "node test/smoke_live.js",
+    "ui": "node test/ui_live.js",
+    "migrate:oplog": "node scripts/migrate_oplog.js",
+    "verify:oplog": "node scripts/verify_oplog.js"
   },
   "license": "UNLICENSED"
 }

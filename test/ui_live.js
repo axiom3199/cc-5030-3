@@ -3,29 +3,59 @@
 // Real-browser verification of the collaborative UI: two editor panels, each
 // with its own websocket, driven through insert -> pending -> confirmed ->
 // conflict -> reconnect, with assertions on what is actually rendered.
-const { chromium } = require('/tmp/pw/node_modules/playwright-core');
+const { chromium } = require(process.env.PLAYWRIGHT_CORE || '/tmp/pw/node_modules/playwright-core');
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const PORT = process.env.PORT || 8082;
 const url = `http://127.0.0.1:${PORT}/`;
 
-const EXECUTABLE = process.env.CHROME_HEADLESS_SHELL ||
-  '/home/node/.cache/ms-playwright/chromium_headless_shell-1255/chrome-headless-shell-linux-arm64/chrome-headless-shell';
+function findExecutable() {
+  if (process.env.CHROME_HEADLESS_SHELL && fs.existsSync(process.env.CHROME_HEADLESS_SHELL)) {
+    return process.env.CHROME_HEADLESS_SHELL;
+  }
+  const roots = [
+    '/home/node/.cache/ms-playwright',
+    path.join(process.env.HOME || '/home/node', '.cache/ms-playwright'),
+  ];
+  const candidates = [];
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    for (const d of fs.readdirSync(root).filter((x) => x.includes('chromium_headless_shell')).sort()) {
+      candidates.push(path.join(root, d, 'chrome-linux', 'headless_shell'));
+      candidates.push(path.join(root, d, 'chrome-headless-shell-linux-arm64', 'chrome-headless-shell'));
+    }
+  }
+  const hit = candidates.find((p) => fs.existsSync(p));
+  if (hit) return hit;
+  return '/home/node/.cache/ms-playwright/chromium_headless_shell-1255/chrome-headless-shell-linux-arm64/chrome-headless-shell';
+}
+const EXECUTABLE = findExecutable();
 const EXTRA_LIB = '/tmp/libs/usr/lib/aarch64-linux-gnu:/tmp/libs/lib/aarch64-linux-gnu';
 
-function startServer() {
+async function startServer() {
+  // Reuse an already-running server (e.g. started in a sandboxed background
+  // task); only spawn one when the port is not serving yet.
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/snapshot`);
+    if (r.ok) return { child: null, owned: false };
+  } catch { /* not running — spawn below */ }
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'bin', 'serve.js')], {
-    env: { ...process.env, PORT: String(PORT), LD_LIBRARY_PATH: `${EXTRA_LIB}:${process.env.LD_LIBRARY_PATH || ''}` },
+    env: {
+      ...process.env, PORT: String(PORT), OPLOG_FILE: '',
+      LD_LIBRARY_PATH: `${EXTRA_LIB}:${process.env.LD_LIBRARY_PATH || ''}`,
+    },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('server start timeout')), 8000);
     child.stdout.on('data', function onData(chunk) {
-      if (String(chunk).includes('collab edit server')) { clearTimeout(timer); resolve(child); }
+      if (String(chunk).includes('collab edit server')) { clearTimeout(timer); resolve(); }
     });
     child.on('exit', (code) => reject(new Error(`server exited early ${code}`)));
   });
+  return { child, owned: true };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -55,7 +85,7 @@ async function selectType(page, editor, type) {
 }
 
 (async () => {
-  const server = await startServer();
+  const { child, owned } = await startServer();
   let exitCode = 0;
   try {
   const browser = await chromium.launch({
@@ -120,12 +150,65 @@ async function selectType(page, editor, type) {
   const clipCount = await page.locator('#panel-alice .clip').count();
   console.log('UI: after duplicate resend, clip count =', clipCount, '(expect 1)');
 
+  // Kernel-driven drag: alice drags ui-1 to a new timeline position, then
+  // switches to bob's panel and verifies the concurrent timeline converged.
+  await selectType(page, 'alice', 'insert');
+  const ins2 = { clipId: 'ui-2', srcIn: 0, srcOut: 3000, timelineIn: 20000 };
+  await fillOp(page, 'alice', ins2);
+  await expectPendingCleared(page, 'alice');
+  await page.locator('#panel-bob .clip', { hasText: 'ui-2' }).waitFor({ timeout: 5000 });
+
+  // Dispatch the same HTML5 DnD events the browser would fire on a real drag;
+  // the drop handler turns the gesture into a kernel move op.
+  const dragResult = await page.evaluate(() => {
+    const panel = document.querySelector('#panel-alice');
+    const track = panel.querySelector('.track');
+    const clip = [...panel.querySelectorAll('.clip')].find((el) => el.textContent.includes('ui-2'));
+    const rect = track.getBoundingClientRect();
+    const data = new DataTransfer();
+    clip.dispatchEvent(new DragEvent('dragstart', { dataTransfer: data, bubbles: true, cancelable: true }));
+    track.dispatchEvent(new DragEvent('drop', {
+      dataTransfer: data, bubbles: true, cancelable: true,
+      clientX: rect.left + rect.width * 0.6, clientY: rect.top + rect.height / 2,
+    }));
+    return { dropped: data.getData('text/plain') };
+  });
+  console.log('UI: dispatched drag for', dragResult.dropped);
+  await sleep(500);
+
+  // Bob's panel must render the same moved position (kernel + journal truth).
+  await sleep(400);
+  const bobPos = await page.locator('#panel-bob .clip', { hasText: 'ui-2' }).evaluate((el) => el.style.left);
+  const alicePos = await page.locator('#panel-alice .clip', { hasText: 'ui-2' }).evaluate((el) => el.style.left);
+  console.log('UI: drag ui-2 -> alice left =', alicePos, ' bob left =', bobPos);
+  if (bobPos !== alicePos) throw new Error('panels diverged after drag (concurrent timeline mismatch)');
+
+  // Kernel undo button on the last applied record restores the prior position.
+  const beforeUndo = alicePos;
+  const undoBtns = page.locator('#panel-alice .log-list li.applied .undo-btn');
+  const undoCount = await undoBtns.count();
+  await undoBtns.nth(undoCount - 1).click();
+  await sleep(600);
+  const afterUndo = await page.locator('#panel-alice .clip', { hasText: 'ui-2' }).evaluate((el) => el.style.left);
+  console.log('UI: kernel undo changed ui-2 left', beforeUndo, '->', afterUndo);
+  if (afterUndo === beforeUndo) throw new Error('undo did not move the clip back');
+  const bobAfter = await page.locator('#panel-bob .clip', { hasText: 'ui-2' }).evaluate((el) => el.style.left);
+  if (bobAfter !== afterUndo) throw new Error('bob panel did not converge after undo');
+
+  // The oplog badge must advertise the migrated v2 log format in both panels.
+  for (const editor of ['alice', 'bob']) {
+    const badge = await page.locator(`#panel-${editor} .logformat.badge`).innerText();
+    console.log(`UI: ${editor} log badge =`, badge);
+    if (!/collab-oplog v2/.test(badge)) throw new Error(`missing v2 oplog badge on ${editor}`);
+  }
+
   await page.screenshot({ path: '/tmp/collab_ui.png', fullPage: true });
 
   if (errors.length) { console.error('PAGE ERRORS:', errors); exitCode = 1; }
   console.log('UI: no page/console errors');
   await browser.close();
   } catch (e) { console.error('UI TEST FAILED', e); exitCode = 1; }
-  server.kill('SIGTERM');
+  if (owned && child) child.kill('SIGTERM');
   process.exit(exitCode);
 })();
+

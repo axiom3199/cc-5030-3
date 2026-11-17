@@ -30,6 +30,7 @@
       <h2 class="name"></h2>
       <span class="conn badge">未连接</span>
       <span class="ver badge">v0 / seq0</span>
+      <span class="logformat badge">日志格式 -</span>
       <span class="peers badge"></span>
     </div>
     <div class="faults">
@@ -93,11 +94,12 @@
   </div>
 
   <div class="eventlog">
-    <h3>事件日志（可重放）</h3>
+    <h3>事件日志（v2 操作日志，可重放；每条已确认记录可由内核撤销）</h3>
     <ol class="log-list"></ol>
   </div>
 </template>
 
+<script src="/collab.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

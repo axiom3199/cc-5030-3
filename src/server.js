@@ -8,15 +8,33 @@ const { TimelineStore } = require('./store');
 const { MediaLibrary } = require('./media');
 const { upgrade, WSConnection } = require('./ws');
 const { TICKS_PER_SECOND } = require('./time');
+const { OplogSink, LOG_FORMAT, LOG_FORMAT_VERSION, readOplog } = require('./oplog');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.json': 'application/json' };
 
-function createServer({ mediaDir, sources, log = console }) {
-  const store = new TimelineStore(sources);
+function createServer({ mediaDir, sources, log = console, oplogFile = null }) {
+  // Rebuild the authoritative timeline from the explicit v2 oplog when one is
+  // configured; otherwise start empty (in-memory history, as before).
+  let store;
+  let restored = { applied: 0, rejected: 0, unknown: 0 };
+  if (oplogFile && fs.existsSync(oplogFile)) {
+    store = TimelineStore.fromOplog(sources, oplogFile);
+    const parsed = readOplog(oplogFile);
+    restored = {
+      applied: parsed.records.filter((r) => r.type === 'applied').length,
+      rejected: parsed.records.filter((r) => r.type === 'rejected').length,
+      unknown: parsed.unknown.length,
+    };
+    log.log(`[oplog] restored v${LOG_FORMAT_VERSION} history from ${oplogFile}: ${restored.applied} applied, ${restored.rejected} rejected`);
+  } else {
+    store = new TimelineStore(sources);
+  }
+  store.sink = oplogFile ? new OplogSink(oplogFile) : null;
   const media = new MediaLibrary(mediaDir);
   const hub = new Map(); // clientId -> WSConnection
   let connCounter = 0;
+  let undoCounter = 0;
 
   function broadcast(event, exceptId) {
     const text = JSON.stringify(event);
@@ -47,6 +65,34 @@ function createServer({ mediaDir, sources, log = console }) {
     }
   }
 
+  // Undo is a kernel feature: the store derives inverse ops from the explicit
+  // result of the chosen record and re-applies them through the normal conflict
+  // rules. Any failure is reported back as an ordinary rejected record.
+  function onUndo(conn, msg) {
+    const clientId = conn.clientId;
+    if (!clientId) { conn.send({ type: 'error', reason: 'hello required before undo' }); return; }
+    const seq = Number(msg && msg.seq);
+    if (!Number.isInteger(seq)) { conn.send({ type: 'error', reason: 'undo requires integer seq' }); return; }
+    const target = store.appliedAt(seq);
+    if (!target) { conn.send({ type: 'error', reason: `no applied record at seq ${seq}` }); return; }
+    undoCounter += 1;
+    const undoId = `undo-${seq}-${undoCounter}-${Date.now().toString(36)}`;
+    const inverseOps = store.buildUndoOps(seq, undoId);
+    if (!inverseOps.length) {
+      conn.send({ type: 'error', reason: `seq ${seq} cannot be inverted` });
+      return;
+    }
+    const responses = [];
+    for (const inverse of inverseOps) {
+      store.refreshUndoBase(inverseOps);
+      const result = store.apply(inverse);
+      conn.send(result);
+      if (!result.duplicate) broadcast(result, clientId);
+      responses.push(result);
+    }
+    conn.send({ type: 'undo_done', undoOf: seq, undoId, responses });
+  }
+
   function handleConnection(conn) {
     connCounter += 1;
     conn.peerLabel = `conn#${connCounter}`;
@@ -59,13 +105,17 @@ function createServer({ mediaDir, sources, log = console }) {
         const reconnecting = hub.has(clientId);
         hub.set(clientId, conn);
         conn.clientId = clientId;
-        conn.send({ type: 'hello_ack', clientId, serverVersion: store.version, seq: store.seq, reconnecting });
+        conn.send({
+          type: 'hello_ack', clientId, serverVersion: store.version, seq: store.seq, recNo: store.recNo,
+          reconnecting, logFormat: store.logFormat,
+        });
         // Re-send everything the client may have missed, then a fresh snapshot.
+        // The log is ordered by explicit seq regardless of any on-disk layout.
         const since = Number.isInteger(msg.lastSeq) ? Math.max(0, msg.lastSeq) : 0;
-        for (const ev of store.log) if (ev.seq > since) conn.send(ev);
+        for (const ev of [...store.log].sort((a, b) => a.seq - b.seq)) if (ev.seq > since) conn.send(ev);
         // A brand-new session gets the full rejection history once; a reconnect
         // only replays missed applied events (the snapshot carries the truth).
-        if (!Number.isInteger(msg.lastSeq)) for (const rj of store.rejects) conn.send(rj);
+        if (!Number.isInteger(msg.lastSeq)) for (const rj of [...store.rejects].sort((a, b) => a.recNo - b.recNo)) conn.send(rj);
         conn.send({ type: 'snapshot', state: store.snapshot(), peers: [...hub.keys()] });
         log.log(`[hub] ${clientId} connected${reconnecting ? ' (reconnect, replay since seq ' + since + ')' : ''}, peers=${[...hub.keys()].join(',')}`);
         broadcast({ type: 'peer_joined', clientId, peers: [...hub.keys()] }, clientId);
@@ -77,6 +127,8 @@ function createServer({ mediaDir, sources, log = console }) {
           return;
         }
         onOp(conn, msg.op);
+      } else if (msg.type === 'undo') {
+        onUndo(conn, msg);
       } else if (msg.type === 'ping') {
         conn.send({ type: 'pong', seq: msg.seq });
       } else {
@@ -113,7 +165,23 @@ function createServer({ mediaDir, sources, log = console }) {
     const p = u.searchParams;
     if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') return; // handled below
     if (u.pathname === '/api/snapshot') return sendJson(res, 200, store.snapshot());
-    if (u.pathname === '/api/log') return sendJson(res, 200, { applied: store.log, rejected: store.rejects });
+    if (u.pathname === '/api/log') return sendJson(res, 200, {
+      logFormat: store.logFormat,
+      formatVersion: LOG_FORMAT_VERSION,
+      applied: store.log,
+      rejected: store.rejects,
+    });
+    if (u.pathname === '/api/oplog') {
+      // The on-disk v2 stream itself, in explicit seq/recNo order — file order
+      // is never assumed by the loader.
+      const applied = [...store.log].sort((a, b) => a.seq - b.seq);
+      const rejected = [...store.rejects].sort((a, b) => a.recNo - b.recNo);
+      const records = [...applied, ...rejected].sort((a, b) => a.recNo - b.recNo);
+      return sendJson(res, 200, {
+        header: { mark: 'header', format: LOG_FORMAT, formatVersion: LOG_FORMAT_VERSION },
+        restored, oplogFile: oplogFile || null, records,
+      });
+    }
     if (u.pathname === '/api/render') {
       const plan = media.renderPlan(store.snapshot());
       return sendJson(res, 200, { ticksPerSecond: TICKS_PER_SECOND, frameCount: plan.length, plan });
@@ -161,6 +229,8 @@ function createServer({ mediaDir, sources, log = console }) {
         exportedAt: new Date().toISOString(),
         serverVersion: snap.version,
         eventSeq: snap.seq,
+        oplogFormat: LOG_FORMAT,
+        oplogFormatVersion: LOG_FORMAT_VERSION,
         clips: edl,
         renderPlan: plan,
       });
@@ -175,6 +245,8 @@ function createServer({ mediaDir, sources, log = console }) {
 
   return {
     server, store, media,
+    oplogFile,
+    restored,
     listen: (port, cb) => server.listen(port, cb),
     close: () => { for (const c of hub.values()) c.close(); server.close(); },
     _hub: hub,

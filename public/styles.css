@@ -79,3 +79,6 @@ ul { list-style: none; margin: 0; padding: 0; }
 .log-list li.applied { border-left: 3px solid var(--ok); }
 .log-list li.rejected { border-left: 3px solid var(--warn); }
 .log-list .seq { color: var(--muted); }
+.log-list .undo-btn { margin-top: 4px; font-size: 10px; padding: 2px 8px; }
+.clip[draggable="true"] { cursor: grab; }
+.clip[draggable="true"]:active { cursor: grabbing; opacity: .8; }
